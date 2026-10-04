@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -250,6 +251,9 @@ class VpnService : android.net.VpnService(), VpnClientListener {
             LOG.error("Failed to parse Vpn Interface config")
             return
         }
+        // The native client applies the configured log level only when it is created, after the
+        // TUN interface is set up, so apply it now for the messages logged before that.
+        VpnClient.applyLogLevel(VpnServiceConfig.parseLogLevel(configStr))
 
         try {
             certificateVerificator = CertificateVerificator()
@@ -302,11 +306,8 @@ class VpnService : android.net.VpnService(), VpnClientListener {
         LOG.info("Request 'create tun interface' received")
         val tunConfig = config.listener.tun
         try {
-            val builder = Builder().setSession("Trust Tunnel")
-                .setMtu(tunConfig.mtuSize.toInt())
-                .addAddress("172.20.2.13", 32)
-                .addAddress("fdfd:29::2", 64)
-                .addDisallowedApplication(applicationContext.packageName)
+            val builder = newTunBuilder(tunConfig)
+            applySplitTunnelRules(builder, resolveSplitTunnelRules(tunConfig))
             val dnsServers = if (config.endpoint.dnsUpstreams.isEmpty()) {
                 ADGUARD_DNS_SERVERS
             } else {
@@ -333,6 +334,66 @@ class VpnService : android.net.VpnService(), VpnClientListener {
             LOG.error("Error while building the TUN interface", e)
             return null
         }
+    }
+
+    private fun newTunBuilder(tunConfig: Tun): Builder = Builder().setSession("Trust Tunnel")
+        .setMtu(tunConfig.mtuSize.toInt())
+        .addAddress("172.20.2.13", 32)
+        .addAddress("fdfd:29::2", 64)
+
+    private fun resolveSplitTunnelRules(tunConfig: Tun): SplitTunnelRules.Result {
+        val rules = SplitTunnelRules.resolve(
+            modeWire = tunConfig.splitTunnelMode,
+            apps = tunConfig.splitTunnelApps,
+            selfPackage = applicationContext.packageName,
+            isInstalled = ::isPackageInstalled,
+        )
+        // Package names are user data: only counts are logged above the debug level.
+        rules.unknownModeWire?.let { LOG.warn("Split tunnel: unknown split_tunnel_mode '$it', treating it as 'off'") }
+        if (rules.ignored.isNotEmpty()) {
+            LOG.debug("Split tunnel: ${rules.ignored.size} listed entries ignored (blank, duplicate or this app)")
+        }
+        if (rules.unresolved.isNotEmpty()) {
+            LOG.warn("Split tunnel: ${rules.unresolved.size} listed app(s) are not installed or not visible to this app")
+        }
+        rules.fallbackReason?.let {
+            LOG.error("Split tunnel: 'include' requested but none of the listed apps is installed and visible to this app ($it), falling back to the full tunnel")
+        }
+        LOG.info("Split tunnel: mode=${rules.effectiveMode.wire} (requested=${rules.requestedMode.wire}) " +
+            "allowed=${rules.allowedPackages.size} disallowed=${rules.disallowedPackages.size} " +
+            "unresolved=${rules.unresolved.size}")
+        LOG.debug("Split tunnel: allowed=${rules.allowedPackages} disallowed=${rules.disallowedPackages} " +
+            "unresolved=${rules.unresolved}")
+        return rules
+    }
+
+    /** Applies the rules to [builder]; never mixes allowed and disallowed apps. */
+    private fun applySplitTunnelRules(builder: Builder, rules: SplitTunnelRules.Result) {
+        val include = rules.effectiveMode == SplitTunnelMode.INCLUDE
+        val packages = if (include) rules.allowedPackages else rules.disallowedPackages
+        for (pkg in packages) {
+            try {
+                if (include) builder.addAllowedApplication(pkg) else builder.addDisallowedApplication(pkg)
+            } catch (e: PackageManager.NameNotFoundException) {
+                // Declared by the API, but AOSP ignores unknown packages instead of throwing; only
+                // vendor builds may throw. An app uninstalled after the check above is resolved to
+                // no UID by the system, so an `include` tunnel can then cover no app until restarted.
+                LOG.warn("Split tunnel: a listed app is not installed, skipping it")
+            }
+        }
+    }
+
+    private fun isPackageInstalled(packageName: String): Boolean = try {
+        val pm = applicationContext.packageManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0L))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getApplicationInfo(packageName, 0)
+        }
+        true
+    } catch (e: PackageManager.NameNotFoundException) {
+        false
     }
 
     /**

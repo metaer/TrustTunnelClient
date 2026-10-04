@@ -18,6 +18,21 @@ class VpnClient (
         }
         private val LOG = Logger("VpnClient")
 
+        /**
+         * Applies the configuration's `loglevel` value (`error`, `warn`, `info`, `debug` or `trace`)
+         * to native and platform-side logs. A missing or unknown value maps to `info`. The native client
+         * also defaults a missing value to `info`, but rejects an unknown one when it parses the configuration.
+         */
+        fun applyLogLevel(loglevel: String?) {
+            NativeLogger.defaultLogLevel = when (loglevel) {
+                "error" -> NativeLoggerLevel.ERROR
+                "warn" -> NativeLoggerLevel.WARN
+                "debug" -> NativeLoggerLevel.DEBUG
+                "trace" -> NativeLoggerLevel.TRACE
+                else -> NativeLoggerLevel.INFO
+            }
+        }
+
         fun excludeCidr(includedRoutes: List<String>, excludedRoutes: List<String>): List<String>? {
             return excludeCidr(includedRoutes.toTypedArray(), excludedRoutes.toTypedArray())?.toList()
         }

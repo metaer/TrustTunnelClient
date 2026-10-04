@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add `split_tunnel_mode` (`off`, `include`, `exclude`) and `split_tunnel_apps` options to the `[listener.tun]` section for per-app split tunneling on Android: route only the listed apps through the tunnel, or route all apps except the listed ones. The core and the other platforms ignore these options.
+
 ### Changed
 
 ### Deprecated
