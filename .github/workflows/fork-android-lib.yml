@@ -1,0 +1,270 @@
+name: Fork - Android library (prebuilt native)
+
+# Fork-only workflow. Builds the Android adapter AAR with the native libraries taken from the
+# official AAR of the base version (no NDK/CMake/Conan build), runs the JVM unit tests and
+# publishes the AAR to this repository's GitHub Packages:
+#   - push to split-tunnel: build and test only, version <base>-split.dev<run number>;
+#   - tag android-lib/v<base>-split.<n>: build, test and publish version <base>-split.<n>;
+#   - manual run with publish_version=<base>-split.<n>: same as the tag. GitHub only shows the
+#     "Run workflow" button for workflows on the default branch: make split-tunnel the default
+#     branch, or run `gh workflow run fork-android-lib.yml --ref split-tunnel -f publish_version=...`.
+# Published versions are immutable: a version that already exists is never re-published.
+#
+# Required repository secret: GPR_KEY, a classic personal access token with the read:packages
+# scope. GitHub Packages requires authentication even for public packages, and GITHUB_TOKEN
+# cannot read another repository's packages. Publishing uses GITHUB_TOKEN.
+
+on:
+  push:
+    branches: [split-tunnel]
+    tags: ['android-lib/v*']
+  workflow_dispatch:
+    inputs:
+      publish_version:
+        description: "Publish as this version, <base_version>-split.<n> (e.g. 1.1.5-rc.6-split.2). Empty: build only."
+        required: false
+        type: string
+      base_version:
+        description: "Official library version whose native libraries are reused. Empty: DEFAULT_BASE_VERSION of this workflow."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+# A publishing run gets its own group, so a later push to the branch cannot cancel it while queued.
+concurrency:
+  group: fork-android-lib-${{ github.ref }}-${{ inputs.publish_version || 'build' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Upstream release the fork branch is based on; update it when rebasing onto a newer release.
+  DEFAULT_BASE_VERSION: '1.1.5-rc.6'
+  PREBUILT_DIR: ${{ github.workspace }}/prebuilt-native
+  AAR_PATH: platform/android/lib/build/outputs/aar/lib-release.aar
+
+jobs:
+  android-lib:
+    name: Build, test and publish the Android library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check required secrets
+        env:
+          GPR_KEY: ${{ secrets.GPR_KEY }}
+        run: |
+          if [[ -z "$GPR_KEY" ]]; then
+            echo "::error title=Missing secret GPR_KEY::Add the repository secret GPR_KEY: a classic personal access token with the read:packages scope. It is needed to download the official AAR (native libraries) from GitHub Packages."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Inputs are passed through the environment, never interpolated into the script, and every
+      # value is validated before it is written to GITHUB_ENV.
+      - name: Resolve version
+        env:
+          INPUT_PUBLISH_VERSION: ${{ inputs.publish_version }}
+          INPUT_BASE_VERSION: ${{ inputs.base_version }}
+        run: |
+          set -euo pipefail
+          base="${INPUT_BASE_VERSION:-$DEFAULT_BASE_VERSION}"
+          requested="${INPUT_PUBLISH_VERSION:-}"
+          if [[ ! "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::base version '$base' is not a library version such as 1.1.5-rc.6"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" == refs/tags/android-lib/v* ]]; then
+            version="${GITHUB_REF_NAME#android-lib/v}"
+            if [[ -n "$requested" && "$requested" != "$version" ]]; then
+              echo "::error::publish_version '$requested' contradicts the tag $GITHUB_REF_NAME"
+              exit 1
+            fi
+            publish=true
+          elif [[ -n "$requested" ]]; then
+            version="$requested"
+            publish=true
+          else
+            version="${base}-split.dev${GITHUB_RUN_NUMBER}"
+            publish=false
+          fi
+
+          if [[ "$publish" == true ]]; then
+            n="${version#"${base}-split."}"
+            if [[ "$version" != "${base}-split.${n}" || ! "$n" =~ ^[0-9]+$ ]]; then
+              echo "::error::version '$version' cannot be published: it must be ${base}-split.<n> (tag android-lib/v${base}-split.<n>)"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "BASE_VERSION=$base"
+            echo "LIB_VERSION=$version"
+            echo "PUBLISH=$publish"
+          } >> "$GITHUB_ENV"
+          echo "Library version $version (publish: $publish), native libraries from $base"
+
+      - name: Refuse to overwrite a published version
+        if: env.PUBLISH == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/adguard/trusttunnel/trusttunnel-client-android/${LIB_VERSION}/trusttunnel-client-android-${LIB_VERSION}.pom"
+          # GitHub Packages answers an existing file with a redirect to its storage: follow it (curl
+          # does not send the credentials to the other host).
+          code="$(curl -sS -L --retry 3 -o /dev/null -w '%{http_code}' -u "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$url")"
+          case "$code" in
+            200)
+              echo "::error::trusttunnel-client-android $LIB_VERSION is already published in this repository's GitHub Packages. Versions are immutable: tag the next android-lib/v${BASE_VERSION}-split.<n> instead."
+              exit 1
+              ;;
+            404)
+              echo "trusttunnel-client-android $LIB_VERSION is not published yet"
+              ;;
+            *)
+              # The registry itself rejects re-publishing an existing version (HTTP 409).
+              echo "::warning::Could not check whether trusttunnel-client-android $LIB_VERSION is already published (HTTP $code); continuing"
+              ;;
+          esac
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+        with:
+          # setup-gradle writes its cache only on the default branch unless told otherwise: let
+          # split-tunnel runs write it even when it is not the default branch. Tag runs stay
+          # read-only, since a cache saved under a tag could not be restored by any other run.
+          cache-read-only: ${{ github.ref != 'refs/heads/split-tunnel' }}
+
+      # The runner image ships the Android SDK in $ANDROID_HOME. Pin what AGP 8.9.1 and
+      # compileSdk 35 need instead of relying on the image contents. No NDK: nothing native is built.
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install "platforms;android-35" "build-tools;35.0.0" > /dev/null
+
+      - name: Download the official AAR and extract its native libraries
+        env:
+          GPR_KEY: ${{ secrets.GPR_KEY }}
+        run: |
+          set -euo pipefail
+          artifact=trusttunnel-client-android
+          url="https://maven.pkg.github.com/TrustTunnel/TrustTunnelClient/com/adguard/trusttunnel/${artifact}/${BASE_VERSION}/${artifact}-${BASE_VERSION}.aar"
+          aar="$RUNNER_TEMP/official.aar"
+          if ! curl -fsSL --retry 3 -u "${GITHUB_ACTOR}:${GPR_KEY}" -o "$aar" "$url"; then
+            echo "::error::Could not download $url. Check that GPR_KEY is a classic token with read:packages and that version $BASE_VERSION is published."
+            exit 1
+          fi
+          if ! unzip -q "$aar" 'jni/*' -d "$RUNNER_TEMP/official-aar"; then
+            echo "::error::The official $BASE_VERSION AAR contains no jni/ directory"
+            exit 1
+          fi
+          mkdir -p "$PREBUILT_DIR"
+          cp -R "$RUNNER_TEMP/official-aar/jni/." "$PREBUILT_DIR/"
+          ls -lR "$PREBUILT_DIR"
+
+      - name: Check the native libraries
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            so="$PREBUILT_DIR/$abi/libtrusttunnel_android.so"
+            if [[ ! -f "$so" ]]; then
+              echo "::error::The official AAR has no jni/$abi/libtrusttunnel_android.so"
+              exit 1
+            fi
+            file "$so"
+            # The JNI entry points must be defined, global, default-visibility functions.
+            dynsyms="$(readelf --dyn-syms --wide "$so")"
+            for sym in Java_com_adguard_trusttunnel_VpnClient_createNative \
+                       Java_com_adguard_trusttunnel_VpnClient_excludeCidr \
+                       Java_com_adguard_trusttunnel_DeepLink_decode \
+                       Java_com_adguard_trusttunnel_PersistentRingBuffer_nativeAppend; do
+              if ! grep -Eq "[[:space:]]FUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[[:space:]]+[0-9]+[[:space:]]+${sym}(@|\$)" <<< "$dynsyms"; then
+                echo "::error::$sym is not exported by $abi/libtrusttunnel_android.so"
+                exit 1
+              fi
+            done
+            # Devices with 16 KB memory pages need every LOAD segment of a 64-bit library to be 16 KB aligned.
+            if [[ "$abi" == arm64-v8a || "$abi" == x86_64 ]]; then
+              for align in $(readelf --program-headers --wide "$so" | awk '$1 == "LOAD" && $NF ~ /^0x[0-9a-fA-F]+$/ { print $NF }'); do
+                if (( align < 0x4000 )); then
+                  echo "::warning::$abi/libtrusttunnel_android.so has a LOAD segment aligned to $align, not 16 KB"
+                fi
+              done
+            fi
+          done
+
+      - name: Unit tests
+        working-directory: platform/android
+        run: ./gradlew --no-daemon :lib:testReleaseUnitTest -PttPrebuiltNativeDir="$PREBUILT_DIR" -PttClientVersion="$LIB_VERSION"
+
+      - name: Assemble the AAR
+        working-directory: platform/android
+        run: ./gradlew --no-daemon :lib:assembleRelease -PttPrebuiltNativeDir="$PREBUILT_DIR" -PttClientVersion="$LIB_VERSION"
+
+      - name: Check the AAR contents
+        run: |
+          set -euo pipefail
+          entries="$(unzip -Z1 "$AAR_PATH")"
+          printf '%s\n' "$entries"
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            entry="jni/$abi/libtrusttunnel_android.so"
+            if ! grep -qxF "$entry" <<< "$entries"; then
+              echo "::error::$entry is missing from the AAR"
+              exit 1
+            fi
+            if ! unzip -p "$AAR_PATH" "$entry" | cmp -s - "$PREBUILT_DIR/$abi/libtrusttunnel_android.so"; then
+              echo "::error::$entry differs from the official library (it must be packaged unchanged)"
+              exit 1
+            fi
+          done
+          unzip -p "$AAR_PATH" classes.jar > "$RUNNER_TEMP/classes.jar"
+          classes="$(unzip -Z1 "$RUNNER_TEMP/classes.jar")"
+          for cls in SplitTunnelRules SplitTunnelMode VpnService; do
+            if ! grep -qxF "com/adguard/trusttunnel/$cls.class" <<< "$classes"; then
+              echo "::error::com/adguard/trusttunnel/$cls.class is missing from the AAR"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trusttunnel-client-android-${{ env.LIB_VERSION }}
+          path: ${{ env.AAR_PATH }}
+          if-no-files-found: error
+
+      - name: Publish to GitHub Packages
+        if: env.PUBLISH == 'true'
+        working-directory: platform/android
+        env:
+          USERNAME: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}"
+          ./gradlew --no-daemon :lib:publishReleasePublicationToGitHubPackagesRepository \
+            -PttPrebuiltNativeDir="$PREBUILT_DIR" \
+            -PttClientVersion="$LIB_VERSION" \
+            -PttPublishRepoUrl="$repo_url"
+          echo "Published \`com.adguard.trusttunnel:trusttunnel-client-android:$LIB_VERSION\` to $repo_url" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: unit-test-reports
+          path: platform/android/lib/build/reports/tests/
+          if-no-files-found: ignore
